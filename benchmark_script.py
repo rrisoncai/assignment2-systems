@@ -128,12 +128,12 @@ def run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_head
 
         forward_t0 = timeit.default_timer()
         logits = model(x)
+        loss = cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
         if device.type == 'cuda':
             torch.cuda.synchronize()
         forward_ms = (timeit.default_timer() - forward_t0) * 1000
         forward_timing.append(forward_ms)
 
-        loss = cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
         if device.type == 'cuda':
             torch.cuda.synchronize()
         backward_t0 = timeit.default_timer()
