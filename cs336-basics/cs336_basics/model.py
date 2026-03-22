@@ -10,6 +10,7 @@ import einx
 
 import torch
 import torch.nn as nn
+import torch.cuda.nvtx as nvtx
 from torch import Tensor
 from jaxtyping import Float, Bool, Int
 
@@ -239,18 +240,20 @@ class BasicsTransformerLM(nn.Module):
         """
         _, sequence_length = x.size()
 
-        # (batch size, sequence_length, d_model)
-        x = self.token_embeddings(x)
+        with nvtx.range("embedding"):
+            x = self.token_embeddings(x)
 
-        for layer in self.layers:
-            # (batch size, sequence_length, d_model)
-            x = layer(x)
+        with nvtx.range("transformer_layers"):
+            for layer in self.layers:
+                x = layer(x)
 
-        # (batch size, sequence_length, d_model)
-        x = self.ln_final(x)
+        with nvtx.range("ln_final"):
+            x = self.ln_final(x)
 
-        # (batch size, sequence_length, vocab_size)
-        return self.lm_head(x)
+        with nvtx.range("lm_head"):
+            x = self.lm_head(x)
+
+        return x
 
     @torch.no_grad()
     def generate(
@@ -374,15 +377,14 @@ class TransformerBlock(nn.Module):
         Returns:
             FloatTensor of shape `(batch_size, sequence_length, d_model)`.
         """
-        # NOTE: this is a pre-norm Transformer, and differs from the original
-        # description in the paper.
-        # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
-        attn_sublayer_output = x + x_attn
+        with nvtx.range("attention_block"):
+            x_attn = self.attn(self.ln1(x))
+            attn_sublayer_output = x + x_attn
 
-        # Apply the feed-forward sublayer
-        x_ffn = self.ffn(self.ln2(attn_sublayer_output))
-        ffn_sublayer_output = attn_sublayer_output + x_ffn
+        with nvtx.range("ffn_block"):
+            x_ffn = self.ffn(self.ln2(attn_sublayer_output))
+            ffn_sublayer_output = attn_sublayer_output + x_ffn
+
         return ffn_sublayer_output
 
 
@@ -422,14 +424,19 @@ def scaled_dot_product_attention(
     """
 
     d_k = K.shape[-1]
-    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
+    with nvtx.range("qk_matmul"):
+        attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
     if mask is not None:
         attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
+    with nvtx.range("softmax"):
+        attention_weights = softmax(attention_scores, dim=-1)
 
-    return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+    with nvtx.range("pv_matmul"):
+        output = einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
+
+    return output
 
 
 class CausalMultiHeadSelfAttention(nn.Module):
@@ -487,9 +494,10 @@ class CausalMultiHeadSelfAttention(nn.Module):
         *b, sequence_length, d_model = x.size()
         assert d_model == self.d_model
 
-        Q = self.q_proj(x)
-        K = self.k_proj(x)
-        V = self.v_proj(x)
+        with nvtx.range("qkv_projection"):
+            Q = self.q_proj(x)
+            K = self.k_proj(x)
+            V = self.v_proj(x)
 
         # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
         Q, K, V = (
@@ -513,14 +521,16 @@ class CausalMultiHeadSelfAttention(nn.Module):
         causal_mask = qi >= kj  # (query, key)
 
         # Shape: (..., num_heads, sequence_length, d_k)
-        attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
+        with nvtx.range("attention_core"):
+            attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
 
         # Concatenate the attention output from all heads.
         # (..., sequence_length, num_heads * d_v).
         attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
 
         # Apply the output projection
-        output = self.output_proj(attn_output)
+        with nvtx.range("output_projection"):
+            output = self.output_proj(attn_output)
         return output
 
 def silu(x: torch.Tensor):

@@ -27,6 +27,7 @@ import argparse
 import timeit
 import torch
 import numpy as np
+import torch.cuda.nvtx as nvtx
 
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
@@ -127,8 +128,9 @@ def run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_head
             torch.cuda.synchronize()
 
         forward_t0 = timeit.default_timer()
-        logits = model(x)
-        loss = cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+        with nvtx.range("forward"):
+            logits = model(x)
+            loss = cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
         if device.type == 'cuda':
             torch.cuda.synchronize()
         forward_ms = (timeit.default_timer() - forward_t0) * 1000
@@ -137,8 +139,10 @@ def run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_head
         if device.type == 'cuda':
             torch.cuda.synchronize()
         backward_t0 = timeit.default_timer()
-        loss.backward()
-        optimizer.step()
+        with nvtx.range("backward"):
+            loss.backward()
+        with nvtx.range("optimizer"):
+            optimizer.step()
         if device.type == 'cuda':
             torch.cuda.synchronize()
         backward_ms = (timeit.default_timer() - backward_t0) * 1000
