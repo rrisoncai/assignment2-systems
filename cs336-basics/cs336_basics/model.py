@@ -428,7 +428,8 @@ def scaled_dot_product_attention(
         attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
     if mask is not None:
-        attention_scores = torch.where(mask, attention_scores, float("-inf"))
+        with nvtx.range("apply_mask"):
+            attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
     with nvtx.range("softmax"):
         attention_weights = softmax(attention_scores, dim=-1)
@@ -499,34 +500,45 @@ class CausalMultiHeadSelfAttention(nn.Module):
             K = self.k_proj(x)
             V = self.v_proj(x)
 
-        # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
-        Q, K, V = (
-            rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
-            for X in (Q, K, V)
-        )  # fmt: skip
+        with nvtx.range("split_heads"):
+            # Take apart each head from the embedding dimension of Q, K, V to shape (..., num_heads, seq_len, d_k).
+            Q, K, V = (
+                rearrange(X, "... seq (heads d) -> ... heads seq d", heads=self.num_heads)
+                for X in (Q, K, V)
+            )  # fmt: skip
 
         if token_positions is None:
-            token_positions = einx.rearrange("seq -> b... seq", torch.arange(sequence_length, device=x.device), b=[1] * len(b))
+            with nvtx.range("build_token_positions"):
+                token_positions = einx.rearrange(
+                    "seq -> b... seq",
+                    torch.arange(sequence_length, device=x.device),
+                    b=[1] * len(b),
+                )
 
-        # Duplicate token positions for each head
-        token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
+        with nvtx.range("expand_token_positions"):
+            # Duplicate token positions for each head
+            token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
 
-        Q = self.positional_encoder(Q, token_positions)
-        K = self.positional_encoder(K, token_positions)
+        with nvtx.range("apply_rope_q"):
+            Q = self.positional_encoder(Q, token_positions)
+        with nvtx.range("apply_rope_k"):
+            K = self.positional_encoder(K, token_positions)
 
-        # Construct causal mask
-        seq = torch.arange(sequence_length, device=x.device)
-        qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
-        kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
-        causal_mask = qi >= kj  # (query, key)
+        with nvtx.range("build_causal_mask"):
+            # Construct causal mask
+            seq = torch.arange(sequence_length, device=x.device)
+            qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
+            kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
+            causal_mask = qi >= kj  # (query, key)
 
         # Shape: (..., num_heads, sequence_length, d_k)
         with nvtx.range("attention_core"):
             attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
 
-        # Concatenate the attention output from all heads.
-        # (..., sequence_length, num_heads * d_v).
-        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
+        with nvtx.range("merge_heads"):
+            # Concatenate the attention output from all heads.
+            # (..., sequence_length, num_heads * d_v).
+            attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
 
         # Apply the output projection
         with nvtx.range("output_projection"):
