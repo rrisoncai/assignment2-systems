@@ -62,6 +62,9 @@ def parse_args():
     parser.add_argument("--exec_step", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--size", type=str, choices=["custom", *MODEL_SPECS.keys(), "all"], default="custom")
+    # forward: inference only (no_grad); forward_backward: no optimizer (benchmarking_script);
+    # train: forward + backward + AdamW step (nsys_profile (d), memory_profiling)
+    parser.add_argument("--mode", type=str, choices=["forward", "forward_backward", "train"], default="forward_backward")
 
     return parser.parse_args()
 
@@ -94,11 +97,8 @@ def run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_head
         f"params+grads+adam={format_gib(param_bytes + grad_bytes + adam_state_bytes)}"
     )
 
-    optimizer = AdamW(
-        model.parameters(),
-    )
-
-    optimizer.zero_grad(set_to_none=True)
+    # Only allocate AdamW state when we actually take optimizer steps.
+    optimizer = AdamW(model.parameters()) if args.mode == "train" else None
 
     x, y = get_batch(
         dataset=dataset,
@@ -107,60 +107,62 @@ def run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_head
         device=device.type,
     )
 
-    for step in range(args.warmup_step):
+    def sync():
         if device.type == 'cuda':
             torch.cuda.synchronize()
 
-        logits = model(x)
-        loss = cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        print(f"warmup step {step} done")
-
-    forward_timing = []
-    backward_timing = []
-    for step in range(args.exec_step):
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-
-        forward_t0 = timeit.default_timer()
-        with nvtx.range("forward"):
+    def run_step(timings=None):
+        """One step in the configured mode. If timings is given, record ms per phase."""
+        sync()
+        t0 = timeit.default_timer()
+        with nvtx.range("forward"), torch.set_grad_enabled(args.mode != "forward"):
             logits = model(x)
             loss = cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        forward_ms = (timeit.default_timer() - forward_t0) * 1000
-        forward_timing.append(forward_ms)
+        sync()
+        t1 = timeit.default_timer()
+        if args.mode != "forward":
+            with nvtx.range("backward"):
+                loss.backward()
+            sync()
+        t2 = timeit.default_timer()
+        if optimizer is not None:
+            with nvtx.range("optimizer"):
+                optimizer.step()
+            sync()
+        t3 = timeit.default_timer()
+        model.zero_grad(set_to_none=True)
 
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        backward_t0 = timeit.default_timer()
-        with nvtx.range("backward"):
-            loss.backward()
-        with nvtx.range("optimizer"):
-            optimizer.step()
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        backward_ms = (timeit.default_timer() - backward_t0) * 1000
-        backward_timing.append(backward_ms)
+        if timings is not None:
+            timings["forward"].append((t1 - t0) * 1000)
+            timings["backward"].append((t2 - t1) * 1000)
+            timings["optimizer"].append((t3 - t2) * 1000)
 
-        optimizer.zero_grad(set_to_none=True)
+    with nvtx.range("warmup"):
+        for step in range(args.warmup_step):
+            run_step()
+            print(f"warmup step {step} done")
 
-        print(f"execute step {step}: forward={forward_ms:.2f} ms, backward={backward_ms:.2f} ms")
+    # With `nsys profile --capture-range=cudaProfilerApi`, only the measured steps are traced.
+    if device.type == 'cuda':
+        torch.cuda.cudart().cudaProfilerStart()
+    timings = {"forward": [], "backward": [], "optimizer": []}
+    for step in range(args.exec_step):
+        with nvtx.range(f"step_{step}"):
+            run_step(timings)
+        print(
+            f"execute step {step}: forward={timings['forward'][-1]:.2f} ms, "
+            f"backward={timings['backward'][-1]:.2f} ms, optimizer={timings['optimizer'][-1]:.2f} ms"
+        )
+    if device.type == 'cuda':
+        torch.cuda.cudart().cudaProfilerStop()
 
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-
-    forward_mean_ms = np.mean(forward_timing)
-    forward_std_ms = np.std(forward_timing, ddof=1) if len(forward_timing) > 1 else 0.0
-    backward_mean_ms = np.mean(backward_timing)
-    backward_std_ms = np.std(backward_timing, ddof=1) if len(backward_timing) > 1 else 0.0
-    print(f"Forward average={forward_mean_ms:.2f} ms, std={forward_std_ms:.2f}")
-    print(f"Backward average={backward_mean_ms:.2f} ms, std={backward_std_ms:.2f}")
+    phases = {"forward": ["forward"], "forward_backward": ["forward", "backward"], "train": ["forward", "backward", "optimizer"]}
+    for phase in phases[args.mode]:
+        mean_ms = np.mean(timings[phase])
+        std_ms = np.std(timings[phase], ddof=1) if len(timings[phase]) > 1 else 0.0
+        print(f"{phase.capitalize()} average={mean_ms:.2f} ms, std={std_ms:.2f}")
+    if device.type == 'cuda':
+        print(f"Peak memory: {format_gib(torch.cuda.max_memory_allocated())}")
 
 
 def main():
@@ -186,7 +188,13 @@ def main():
             num_layers = spec["num_layers"]
             num_heads = spec["num_heads"]
 
-        run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_heads)
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        try:
+            run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_heads)
+        except torch.cuda.OutOfMemoryError:
+            print(f"OOM: config={config_name} mode={args.mode} context_length={args.context_length}")
 
 if __name__ == "__main__":
     main()
