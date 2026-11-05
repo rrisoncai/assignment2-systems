@@ -144,7 +144,7 @@ class RotaryEmbedding(nn.Module):
         # 2D rotation matrix applied to pairs in x
         x1_rot = cos * x1 - sin * x2
         x2_rot = sin * x1 + cos * x2
-        result = einx.rearrange('... x_half, ... x_half -> ... (x_half (1 + 1))', x1_rot, x2_rot).contiguous()
+        result = einx.id('... x_half, ... x_half -> ... (x_half (1 + 1))', x1_rot, x2_rot).contiguous()
         return result
     
     def extra_repr(self):
@@ -509,7 +509,7 @@ class CausalMultiHeadSelfAttention(nn.Module):
 
         if token_positions is None:
             with nvtx.range("build_token_positions"):
-                token_positions = einx.rearrange(
+                token_positions = einx.id(
                     "seq -> b... seq",
                     torch.arange(sequence_length, device=x.device),
                     b=[1] * len(b),
@@ -527,8 +527,8 @@ class CausalMultiHeadSelfAttention(nn.Module):
         with nvtx.range("build_causal_mask"):
             # Construct causal mask
             seq = torch.arange(sequence_length, device=x.device)
-            qi = einx.rearrange('query -> b... 1 query 1', seq, b=[1] * len(b))
-            kj = einx.rearrange('key   -> b... 1 1   key', seq, b=[1] * len(b))
+            qi = einx.id('query -> b... 1 query 1', seq, b=[1] * len(b))
+            kj = einx.id('key   -> b... 1 1   key', seq, b=[1] * len(b))
             causal_mask = qi >= kj  # (query, key)
 
         # Shape: (..., num_heads, sequence_length, d_k)
