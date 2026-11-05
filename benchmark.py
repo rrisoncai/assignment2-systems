@@ -25,10 +25,14 @@ Deliverable: A 2-3 sentence response.
 
 import argparse
 import timeit
+import types
+from contextlib import nullcontext
+
 import torch
 import numpy as np
 import torch.cuda.nvtx as nvtx
 
+import cs336_basics.model
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.optimizer import AdamW
 from cs336_basics.nn_utils import cross_entropy
@@ -65,6 +69,12 @@ def parse_args():
     # forward: inference only (no_grad); forward_backward: no optimizer (benchmarking_script);
     # train: forward + backward + AdamW step (nsys_profile (d), memory_profiling)
     parser.add_argument("--mode", type=str, choices=["forward", "forward_backward", "train"], default="forward_backward")
+    parser.add_argument("--mixed_precision", action="store_true", help="BF16 autocast for the forward pass and loss")
+    parser.add_argument("--compile", action="store_true", help="torch.compile the whole model")
+    parser.add_argument(
+        "--memory_profile", type=str, default=None,
+        help="record CUDA memory history from the first step and dump a snapshot pickle to this path",
+    )
 
     return parser.parse_args()
 
@@ -85,6 +95,8 @@ def run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_head
         d_ff=d_ff,
         rope_theta=args.rope_theta,
     ).to(device)
+    if args.compile:
+        model = torch.compile(model)
 
     num_params = sum(p.numel() for p in model.parameters())
     param_bytes = num_params * 4
@@ -111,11 +123,15 @@ def run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_head
         if device.type == 'cuda':
             torch.cuda.synchronize()
 
+    autocast = (
+        torch.autocast(device_type=device.type, dtype=torch.bfloat16) if args.mixed_precision else nullcontext()
+    )
+
     def run_step(timings=None):
         """One step in the configured mode. If timings is given, record ms per phase."""
         sync()
         t0 = timeit.default_timer()
-        with nvtx.range("forward"), torch.set_grad_enabled(args.mode != "forward"):
+        with nvtx.range("forward"), torch.set_grad_enabled(args.mode != "forward"), autocast:
             logits = model(x)
             loss = cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
         sync()
@@ -137,24 +153,33 @@ def run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_head
             timings["backward"].append((t2 - t1) * 1000)
             timings["optimizer"].append((t3 - t2) * 1000)
 
-    with nvtx.range("warmup"):
-        for step in range(args.warmup_step):
-            run_step()
-            print(f"warmup step {step} done")
-
-    # With `nsys profile --capture-range=cudaProfilerApi`, only the measured steps are traced.
-    if device.type == 'cuda':
-        torch.cuda.cudart().cudaProfilerStart()
+    # Record from the first step so that a snapshot is still dumped if a step runs out of memory.
+    if args.memory_profile:
+        torch.cuda.memory._record_memory_history(max_entries=1_000_000)
     timings = {"forward": [], "backward": [], "optimizer": []}
-    for step in range(args.exec_step):
-        with nvtx.range(f"step_{step}"):
-            run_step(timings)
-        print(
-            f"execute step {step}: forward={timings['forward'][-1]:.2f} ms, "
-            f"backward={timings['backward'][-1]:.2f} ms, optimizer={timings['optimizer'][-1]:.2f} ms"
-        )
-    if device.type == 'cuda':
-        torch.cuda.cudart().cudaProfilerStop()
+    try:
+        with nvtx.range("warmup"):
+            for step in range(args.warmup_step):
+                run_step()
+                print(f"warmup step {step} done")
+
+        # With `nsys profile --capture-range=cudaProfilerApi`, only the measured steps are traced.
+        if device.type == 'cuda':
+            torch.cuda.cudart().cudaProfilerStart()
+        for step in range(args.exec_step):
+            with nvtx.range(f"step_{step}"):
+                run_step(timings)
+            print(
+                f"execute step {step}: forward={timings['forward'][-1]:.2f} ms, "
+                f"backward={timings['backward'][-1]:.2f} ms, optimizer={timings['optimizer'][-1]:.2f} ms"
+            )
+        if device.type == 'cuda':
+            torch.cuda.cudart().cudaProfilerStop()
+    finally:
+        if args.memory_profile:
+            torch.cuda.memory._dump_snapshot(args.memory_profile)
+            torch.cuda.memory._record_memory_history(enabled=None)
+            print(f"Memory snapshot written to {args.memory_profile}")
 
     phases = {"forward": ["forward"], "forward_backward": ["forward", "backward"], "train": ["forward", "backward", "optimizer"]}
     for phase in phases[args.mode]:
@@ -167,6 +192,10 @@ def run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_head
 
 def main():
     args = parse_args()
+
+    if args.compile:
+        # NVTX push/pop calls inside the model cause torch.compile graph breaks; make them no-ops.
+        cs336_basics.model.nvtx = types.SimpleNamespace(range=lambda *a, **k: nullcontext())
 
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -193,7 +222,13 @@ def main():
             torch.cuda.reset_peak_memory_stats()
         try:
             run_benchmark(args, device, config_name, d_model, d_ff, num_layers, num_heads)
-        except torch.cuda.OutOfMemoryError:
+        except Exception as e:
+            # einx wraps errors raised inside its generated code, so look through the cause chain.
+            err = e
+            while err is not None and not isinstance(err, torch.cuda.OutOfMemoryError):
+                err = err.__cause__
+            if err is None:
+                raise
             print(f"OOM: config={config_name} mode={args.mode} context_length={args.context_length}")
 
 if __name__ == "__main__":
