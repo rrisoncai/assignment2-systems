@@ -8,11 +8,11 @@ Handout: [cs336_spring2025_assignment2_systems.pdf](./cs336_spring2025_assignmen
 |----|---------|----:|-----:|--------|
 | 1.1.3 | [benchmarking_script](#problem-benchmarking_script-4-points) | 4 | 3 | ✅ done |
 | 1.1.4 | [nsys_profile](#problem-nsys_profile-5-points) | 5 | 5 | ✅ done |
-| 1.1.5 | [mixed_precision_accumulation](#problem-mixed_precision_accumulation-1-point) | 1 | 6 | TODO |
-| 1.1.5 | [benchmarking_mixed_precision](#problem-benchmarking_mixed_precision-2-points) | 2 | 7 | TODO |
-| 1.1.6 | [memory_profiling](#problem-memory_profiling-4-points) | 4 | 8 | TODO |
-| 1.2.1 | [pytorch_attention](#problem-pytorch_attention-2-points) | 2 | 9 | draft, needs fixes |
-| 1.3   | [torch_compile](#problem-torch_compile-2-points) | 2 | 10 | TODO |
+| 1.1.5 | [mixed_precision_accumulation](#problem-mixed_precision_accumulation-1-point) | 1 | 6 | ✅ done |
+| 1.1.5 | [benchmarking_mixed_precision](#problem-benchmarking_mixed_precision-2-points) | 2 | 7 | ✅ done |
+| 1.1.6 | [memory_profiling](#problem-memory_profiling-4-points) | 4 | 8 | ✅ done |
+| 1.2.1 | [pytorch_attention](#problem-pytorch_attention-2-points) | 2 | 9 | ✅ done |
+| 1.3   | [torch_compile](#problem-torch_compile-2-points) | 2 | 10 | ✅ done |
 | 1.3.2 | [flash_forward](#problem-flash_forward-15-points) | 15 | 19 | TODO |
 | 1.3.2 | [flash_backward](#problem-flash_backward-5-points) | 5 | 21 | TODO |
 | 1.3.2 | [flash_benchmarking](#problem-flash_benchmarking-5-points) | 5 | 21 | TODO |
@@ -169,12 +169,14 @@ Softmax is memory-bound: each of its elementwise passes reads and writes the who
 
 | Accumulator | Addend | Result |
 |-------------|--------|--------|
-| float32 | float32 |  |
-| float16 | float16 |  |
-| float32 | float16 |  |
-| float32 | float16 → float32 |  |
+| float32 | float32 | 10.000134 |
+| float16 | float16 | 9.953125 |
+| float32 | float16 | 10.002136 |
+| float32 | float16 → float32 | 10.002136 |
 
-**Answer:**
+Script: [scripts/mixed_precision_toy.py](./scripts/mixed_precision_toy.py).
+
+**Answer:** Accumulating in FP32 is nearly exact (10.000134). Accumulating in FP16 drifts to 9.953 (−0.47%): once the sum passes 8, the gap between neighboring FP16 values is 2⁻⁷ ≈ 0.0078, so every `+0.01` is rounded to a multiple of that gap and the rounding errors pile up. Both mixed variants give 10.002136, and that error comes entirely from the FP16 *input*: 0.01 is stored in FP16 as 0.0100021, and 1000 × 0.0100021 = 10.0021. The FP32 accumulation itself adds no error, and adding an FP16 tensor to an FP32 one type-promotes it, so the implicit and explicit casts behave the same. The lesson: low-precision inputs cost only their own representation error, but low-precision accumulators compound rounding error, so reductions and accumulations should stay in FP32.
 
 ---
 
@@ -187,34 +189,38 @@ Softmax is memory-bound: each of its elementwise passes reads and writes the who
 
 | Component | dtype |
 |-----------|-------|
-| model parameters within the autocast context |  |
-| output of `fc1` |  |
-| output of `ln` |  |
-| predicted logits |  |
-| loss |  |
-| gradients |  |
+| model parameters within the autocast context | `float32` (autocast casts copies for each op; the stored parameters stay FP32) |
+| output of `fc1` | `float16` |
+| output of `ln` | `float32` (layer_norm is on autocast's FP32 list) |
+| predicted logits | `float16` |
+| loss | `float32` (cross_entropy is on autocast's FP32 list) |
+| gradients | `float32` (gradients match the FP32 parameters) |
+
+Verified by running the toy model under autocast in [scripts/mixed_precision_toy.py](./scripts/mixed_precision_toy.py). BF16 gives the same pattern, with `bfloat16` in place of `float16`.
 
 ### (b)
 > What parts of layer normalization are sensitive to mixed precision? If we use BF16 instead of FP16, do we still need to treat layer normalization differently? Why or why not?
 >
 > Deliverable: A 2-3 sentence response.
 
-**Answer:**
+**Answer:** The sensitive parts are the reductions and the normalization: computing the mean and variance (a sum of x and of x² over the feature dimension), then dividing by √(var + ε). In FP16, x² overflows for |x| > 256 (max 65504). Summing many terms loses precision with only 10 mantissa bits. ε = 1e-5 is below FP16's smallest normal number (6.1e-5), and a tiny variance makes 1/√var blow up. BF16 has FP32's exponent range, so overflow and underflow mostly go away, but it has only 7 mantissa bits (2–3 significant digits). The mean and variance would still be computed too coarsely, so LayerNorm should still run in FP32. PyTorch's autocast does this for BF16 as well: the `ln` output above is FP32 under BF16 autocast too.
 
 ### (c)
 > Modify your benchmarking script to optionally run the model using mixed precision with BF16. Time the forward and backward passes with and without mixed-precision for each model size. Compare and comment on any trends as model size changes.
 >
 > Deliverable: A 2-3 sentence response with your timings and commentary.
 
-| Size | FP32 fwd (ms) | BF16 fwd (ms) | FP32 bwd (ms) | BF16 bwd (ms) |
-|------|--------------:|--------------:|--------------:|--------------:|
-| small |  |  |  |  |
-| medium |  |  |  |  |
-| large |  |  |  |  |
-| xl |  |  |  |  |
-| 2.7B |  |  |  |  |
+`benchmark.py --mixed_precision` wraps the forward pass and loss in `torch.autocast("cuda", dtype=torch.bfloat16)`. Setup: RTX 4090 D, batch 4, context 512, 5 warm-up + 10 measured steps, forward + backward without the optimizer.
 
-**Answer:**
+| Size | FP32 fwd (ms) | BF16 fwd (ms) | FP32 bwd (ms) | BF16 bwd (ms) | Fwd speedup | Bwd speedup | Peak mem FP32 → BF16 (GiB) |
+|------|--------------:|--------------:|--------------:|--------------:|---:|---:|---:|
+| small | 31.68 | 34.03 | 55.46 | 36.54 | 0.93× | 1.52× | 4.06 → 3.24 |
+| medium | 84.40 | 65.81 | 164.57 | 90.20 | 1.28× | 1.82× | 10.57 → 8.43 |
+| large | 169.29 | 99.64 | 337.36 | 189.94 | 1.70× | 1.78× | 20.27 → 16.61 |
+| xl | OOM | OOM | OOM | OOM | | | |
+| 2.7B | OOM | OOM | OOM | OOM | | | |
+
+**Answer:** BF16 autocast speeds up large by 1.7× (forward) and 1.8× (backward), and medium by 1.3× and 1.8×. In FP32 every matmul runs on CUDA cores (`ampere_sgemm`; TF32 is off by default), while BF16 matmuls run on Tensor Cores. The gain grows with model size, because the large matmuls take a larger share of the time. Small's forward pass is actually 7% *slower* in BF16. It is launch-bound (see nsys_profile), so faster matmuls don't help, and autocast adds a cast kernel for each weight. Its backward still speeds up 1.5×. BF16 also lowers peak memory by about 20%, since the saved activations are half size, but xl and 2.7B still OOM: their FP32 weights and gradients alone are 14.9 / 25.4 GiB.
 
 ---
 
@@ -227,42 +233,56 @@ Softmax is memory-bound: each of its elementwise passes reads and writes the who
 >
 > Deliverable: Two images of the "Active memory timeline" (forward only, and full training step), and a 2-3 sentence response.
 
-<!-- ![forward](./figures/mem_forward.png) -->
-<!-- ![train step](./figures/mem_train_step.png) -->
+`benchmark.py --memory_profile <path>` records CUDA memory history from the first step (1 warm-up + 1 measured step) and dumps a snapshot, even if a step runs out of memory. [scripts/memory_analyze.py](./scripts/memory_analyze.py) rebuilds the "Active Memory Timeline" from the snapshot (as a PNG) and lists the largest allocations with their source lines. On a 24 GB RTX 4090 D, a full 2.7B training step cannot fit: FP32 weights + gradients + AdamW state alone are 4 × 12.7 = 50.8 GiB. So the training-step timelines show the 2.7B run up to its OOM, plus a complete step for **medium**, which fits.
 
-**Answer:**
+![2.7B forward, ctx 512](./figures/mem_2.7B_ctx512_forward.png)
+![2.7B training step, ctx 512 (OOM)](./figures/mem_2.7B_ctx512_train.png)
+![medium training step, ctx 512](./figures/mem_medium_ctx512_train.png)
+
+**Answer:** Forward only (no grad), the timeline is a flat 12.8 GiB plateau of FP32 weights. Each layer adds a small temporary bump (at most +0.6 GiB at context 512) because its activations are freed immediately, so each step shows up as a band of 32 small teeth, one per layer. In a training step the stages are easy to read off the medium timeline:
+
+- **Forward:** a linear ramp (1.7 → 10.6 GiB in step 0) as each layer saves its activations.
+- **Peak:** at the forward/backward boundary.
+- **Backward:** a descent to 3.3 GiB of weights + gradients, as activations are freed layer by layer while gradients are allocated.
+- **First optimizer step:** a staircase up to 6.5 GiB as AdamW lazily allocates m and v (4 × 1.58 GiB = weights + grads + m + v).
+- **`zero_grad(set_to_none=True)`:** a sharp drop to 4.8 GiB.
+- **Step 1:** the same ramp starts from this higher floor, so it peaks higher (13.7 GiB).
+
+For 2.7B, the forward ramp alone climbs from 13 to 23 GiB and runs out of memory partway through the first forward pass, after about 12 of the 32 layers judging by the allocation counts. It never reaches backward or the optimizer.
 
 ### (b)
 > What is the peak memory usage of each context length when doing a forward pass? What about a full training step?
 >
 > Deliverable: A table with two numbers per context length.
 
-| context_length | Forward peak (GB) | Train step peak (GB) |
-|---------------:|------------------:|---------------------:|
-| 128 |  |  |
-| 256 |  |  |
-| 512 |  |  |
+| context_length | 2.7B forward peak (GiB) | 2.7B train step peak (GiB) | medium train step peak (GiB), for reference |
+|---------------:|------------------:|---------------------:|---:|
+| 128 | 12.90 | OOM (> 23.1 reached; ≥ 50.8 needed) | 6.54 |
+| 256 | 13.00 | OOM (> 23.1 reached) | 8.49 |
+| 512 | 13.42 | OOM (> 23.0 reached) | 13.73 |
+
+Forward peaks barely depend on context length: weights dominate, and only one layer's activations are alive at a time. Training peaks grow quickly with context length, because all layers' activations, including the O(S²) attention scores, are kept for backward.
 
 ### (c)
 > Find the peak memory usage of the 2.7B model when using mixed-precision, for both a forward pass and a full optimizer step. Does mixed-precision significantly affect memory usage?
 >
 > Deliverable: A 2-3 sentence response.
 
-**Answer:**
+**Answer:** With BF16 autocast at context 512, the 2.7B forward peak *rises* from 13.42 to 19.38 GiB, and the training step still runs out of memory (23.0 GiB reached). For a forward pass, autocast caches a BF16 copy of every FP32 weight (+6.3 GiB) for the whole autocast region, while the per-layer activations it saves are small. For training, BF16 halves the saved activations (the 128 MiB attention-score tensors become 64 MiB), but weights, gradients and AdamW state stay in FP32 (50.8 GiB). So mixed precision doesn't significantly reduce memory for this model: it helps activation-heavy settings (long context, big batch), not parameter-dominated ones. In the medium/large benchmarks above it cut peak memory by about 20%.
 
 ### (d)
 > At our reference hyperparameters, what is the size of a tensor of activations in the Transformer residual stream, in single-precision? Give this size in MB.
 >
 > Deliverable: A 1-2 sentence response with your derivation.
 
-**Answer:**
+**Answer:** One residual-stream activation tensor has shape batch × context × d_model. At batch 4, context 512 and d_model 2560 in FP32 that is 4 × 512 × 2560 × 4 B = 20,971,520 B = **20 MB** (5 MB at context 128 and 10 MB at 256). The model stores at least one such tensor per layer for backward, plus several larger ones inside each block (the 4× wider SwiGLU hidden states and the B·H·S² attention scores).
 
 ### (e)
 > In memory_viz with reduced "Detail", what is the size of the largest allocations shown? Looking through the stack trace, can you tell where those allocations come from?
 >
 > Deliverable: A 1-2 sentence response.
 
-**Answer:**
+**Answer:** In the 2.7B forward pass at context 512, the largest allocations are **128 MiB**. That is exactly one attention-score tensor: B × H × S × S × 4 B = 4 × 32 × 512 × 512 × 4. The stack traces point to `scaled_dot_product_attention` (the QKᵀ einsum, `model.py:428`, and the mask `torch.where`, `:432`) and to the three steps of our softmax (`nn_utils.py:5–7`: subtract max, exp, divide). There are 64 to 128 of each, i.e. 2 to 4 per layer over 32 layers × 2 steps. The next-largest are **80 MiB**: the B × S × d_ff SwiGLU hidden states, from the `Linear` einsum (`model.py:42`) and `silu` (`model.py:549`). At context 128 the S² tensors shrink 16× to 8 MiB, so these FFN tensors (20 MiB) become the largest.
 
 ---
 
@@ -272,61 +292,39 @@ Softmax is memory-bound: each of its elementwise passes reads and writes the who
 >
 > Deliverable: A table with your timings, your working out for the memory usage, and a 1-2 paragraph response.
 
-Script: [cs336_systems/benchmark_pytorch_attention.py](./cs336_systems/benchmark_pytorch_attention.py)
+Script: [cs336_systems/benchmark_pytorch_attention.py](./cs336_systems/benchmark_pytorch_attention.py). Setup: RTX 4090 D (24 GB), FP32, batch 8, single head, causal mask, 10 warm-up iterations. Forward is timed over 100 `no_grad` passes. Memory is `torch.cuda.memory_allocated()` right after one forward with grad, i.e. inputs plus everything saved for backward. Backward is timed over 100 `out.backward(retain_graph=True)` calls through that graph. Times are per pass.
 
-> **TODO (fixes before finalizing):**
-> - Memory is measured as peak during a `no_grad` forward, not "memory in use before backward". Run the forward with grad, then read `torch.cuda.memory_allocated()` before calling `.backward()`.
-> - The backward timing loop also includes `randn` + forward; time only `loss.backward()` (or relabel as fwd+bwd).
-> - OOM arithmetic: `8 × 16384² × 4 B ≈ 8.6 GB` (not 32 GB); OOM on 16 GB comes from several such seq×seq tensors alive at once (scores, masked scores, softmax probs, mask).
+| d_model | seq_len | forward (ms) | backward (ms) | memory before backward (MiB) | peak during forward (MiB) |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 256 | 0.220 | 0.476 | 21.0 | 24.7 |
+| 16 | 1024 | 0.373 | 1.081 | 83.9 | 146.9 |
+| 16 | 4096 | 8.375 | 19.450 | 1066.7 | 2086.7 |
+| 16 | 8192 | 32.571 | 75.576 | 4197.1 | 8285.1 |
+| 16 | 16384 | OOM | OOM | OOM | OOM |
+| 32 | 256 | 0.218 | 0.472 | 21.6 | 25.1 |
+| 32 | 1024 | 0.381 | 1.019 | 86.4 | 148.4 |
+| 32 | 4096 | 8.412 | 19.514 | 1076.7 | 2092.7 |
+| 32 | 8192 | 32.746 | 75.808 | 4217.1 | 8297.1 |
+| 32 | 16384 | OOM | OOM | OOM | OOM |
+| 64 | 256 | 0.222 | 0.480 | 22.8 | 25.8 |
+| 64 | 1024 | 0.387 | 1.034 | 91.4 | 151.4 |
+| 64 | 4096 | 8.475 | 19.786 | 1096.7 | 2104.7 |
+| 64 | 8192 | 32.918 | 76.136 | 4257.1 | 8321.1 |
+| 64 | 16384 | OOM | OOM | OOM | OOM |
+| 128 | 256 | 0.219 | 0.493 | 25.3 | 27.3 |
+| 128 | 1024 | 0.413 | 1.090 | 101.4 | 157.4 |
+| 128 | 4096 | 8.802 | 20.047 | 1136.7 | 2128.7 |
+| 128 | 8192 | 34.312 | 77.734 | 4337.1 | 8369.1 |
+| 128 | 16384 | OOM | OOM | OOM | OOM |
 
-**Forward time (s), 100 iterations total**
+**Memory accounting.** Every d_model runs out of memory at seq_len = 16384; the smallest such config is d_model = 16. One B × S × S FP32 score matrix there is 8 × 16384² × 4 B = 8 GiB. Our attention computes, in order: `QKᵀ`, `/√d`, `where(mask)`, `x − max`, `exp`, `/ sum`, then `@ V`. Autograd keeps two S × S tensors for backward: the `exp` output (needed by the division) and the softmax probabilities (needed by `@ V`). `where` keeps only the S × S boolean mask (1 B/element, 256 MiB, shared across the batch). Q, K, V and the output are only B·S·d·4 B = 8 MiB each. So:
 
-| seq_len \ d_model | 16 | 32 | 64 | 128 |
-|---|---|---|---|---|
-| 256 | 0.0090 | 0.0098 | 0.0100 | 0.0093 |
-| 1024 | 0.0479 | 0.0517 | 0.0540 | 0.0531 |
-| 4096 | 1.2287 | 1.2319 | 1.2404 | 1.2787 |
-| 8192 | 4.8290 | 4.8226 | 4.8511 | 5.0430 |
-| 16384 | OOM | OOM | OOM | OOM |
+- **saved for backward** ≈ 2 × 8 GiB + 0.25 GiB + 4 × 8 MiB ≈ **16.3 GiB**;
+- **peak during forward** ≈ 4 × 8 GiB = **32 GiB**, since two to three temporaries (scores, scaled/masked scores, x − max) are alive alongside the saved tensors.
 
-**Backward time (s), 100 iterations total**
+That exceeds the 23.6 GiB GPU. The measurements at seq_len = 8192 match this model exactly: one S × S tensor is 2 GiB there, the memory before backward is 4197 MiB ≈ 2 × 2048 MiB + mask (64 MiB) + inputs, and the forward peak is 8285 MiB ≈ 4 × 2048 MiB.
 
-| seq_len \ d_model | 16 | 32 | 64 | 128 |
-|---|---|---|---|---|
-| 256 | 0.0537 | 0.0439 | 0.0401 | 0.0560 |
-| 1024 | 0.1767 | 0.1800 | 0.1829 | 0.1891 |
-| 4096 | 4.1112 | 4.1102 | 4.1255 | 4.2234 |
-| 8192 | 16.0184 | 16.0260 | 16.1064 | 16.5473 |
-| 16384 | OOM | OOM | OOM | OOM |
-
-**Memory before backward (MB)**
-
-| seq_len \ d_model | 16 | 32 | 64 | 128 |
-|---|---|---|---|---|
-| 256 | 20.72 | 53.35 | 78.35 | 128.35 |
-| 1024 | 212.13 | 214.88 | 220.38 | 231.38 |
-| 4096 | 3115.78 | 3126.78 | 3148.78 | 3192.78 |
-| 8192 | 12397.31 | 12425.31 | 12481.31 | 12593.31 |
-| 16384 | OOM | OOM | OOM | OOM |
-
-**Memory after backward (MB)**
-
-| seq_len \ d_model | 16 | 32 | 64 | 128 |
-|---|---|---|---|---|
-| 256 | 29.34 | 50.09 | 75.84 | 127.34 |
-| 1024 | 213.35 | 217.35 | 225.35 | 241.35 |
-| 4096 | 3120.66 | 3136.66 | 3168.66 | 3232.66 |
-| 8192 | 12401.06 | 12433.06 | 12497.06 | 12625.06 |
-| 16384 | OOM | OOM | OOM | OOM |
-
-**Memory accounting (seq_len = 16384):**
-
-- OOM 边界：所有 `d_model` 配置在 `seq_len=16384` 时均 OOM，而 `seq_len=8192` 可以运行。OOM 的根本原因是 attention score 矩阵大小为 `batch × seq² × 4 bytes`，在 `seq=16384, batch=8` 时约需 **32GB**（`8 × 16384² × 4B ≈ 32GB`），超出 GPU 显存。
-
-**Answer:**
-
-- **时间与序列长度的关系**：forward/backward 时间随 `seq_len` 呈近似 **O(seq²)** 增长（从 1024→4096 约 ×16→×25，符合二次方特征），这正是标准 attention 的复杂度。
-- **backward memory 与 forward memory 差距很小**：这是因为标准 attention 在 backward 时需要保存 attention weight 矩阵（`batch × seq × seq`），而这个矩阵在 forward 时已经占据了绝大部分内存，backward 额外增量相对较小。消除这部分内存开销的方法是使用 **FlashAttention**，它通过分块重计算避免存储完整的 attention weight 矩阵。
+**Answer:** Forward and backward time and the memory saved for backward all grow quadratically with sequence length once S ≥ 4096: each doubling of S costs 3.9× in time and 3.9× in memory (1067 → 4197 MiB). d_model hardly matters (16 → 128 changes memory by about 3%), because the B × S × S score, probability and `exp` tensors dominate, not the B × S × d inputs. Backward is about 2.3× slower than forward, since it has to read the saved S × S tensors and write S × S gradients. To eliminate this memory cost, don't materialize the S × S matrices: compute attention in tiles with an online softmax, save only Q, K, V, O and the per-row logsumexp (O(S·d) memory), and recompute each probability tile during backward. That is FlashAttention-2, implemented below. At S = 16384, d = 16, the only extra saved tensor would be the 0.5 MiB logsumexp (B × S floats) instead of about 16 GiB.
 
 ---
 
@@ -337,24 +335,47 @@ Script: [cs336_systems/benchmark_pytorch_attention.py](./cs336_systems/benchmark
 >
 > Deliverable: A table comparing forward and backward timings for compiled vs. uncompiled attention.
 
-| seq_len | d_model | Fwd eager (s) | Fwd compiled (s) | Bwd eager (s) | Bwd compiled (s) |
-|--------:|--------:|--------------:|-----------------:|--------------:|-----------------:|
-|  |  |  |  |  |  |
+`benchmark_pytorch_attention.py --compile` adds `torch.compile(scaled_dot_product_attention)`, with the same configs and protocol as above (per-pass ms; both the grad and no-grad paths are warmed up, and shapes are compiled as static).
+
+| d_model | seq_len | Fwd eager (ms) | Fwd compiled (ms) | Bwd eager (ms) | Bwd compiled (ms) | Fwd / bwd speedup | Peak in forward, eager → compiled (MiB) |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 256 | 0.220 | 0.097 | 0.476 | 0.253 | 2.3× / 1.9× | 24.7 → 21.0 |
+| 16 | 1024 | 0.373 | 0.164 | 1.081 | 0.585 | 2.3× / 1.8× | 146.9 → 83.9 |
+| 16 | 4096 | 8.375 | 2.859 | 19.450 | 8.284 | 2.9× / 2.3× | 2086.7 → 1066.8 |
+| 16 | 8192 | 32.571 | 10.640 | 75.576 | 30.941 | 3.1× / 2.4× | 8285.1 → 4197.3 |
+| 32 | 256 | 0.218 | 0.094 | 0.472 | 0.254 | 2.3× / 1.9× | 25.1 → 21.6 |
+| 32 | 1024 | 0.381 | 0.170 | 1.019 | 0.591 | 2.2× / 1.7× | 148.4 → 86.4 |
+| 32 | 4096 | 8.412 | 2.889 | 19.514 | 8.348 | 2.9× / 2.3× | 2092.7 → 1076.8 |
+| 32 | 8192 | 32.746 | 10.808 | 75.808 | 31.164 | 3.0× / 2.4× | 8297.1 → 4217.3 |
+| 64 | 256 | 0.222 | 0.096 | 0.480 | 0.254 | 2.3× / 1.9× | 25.8 → 22.8 |
+| 64 | 1024 | 0.387 | 0.182 | 1.034 | 0.616 | 2.1× / 1.7× | 151.4 → 91.4 |
+| 64 | 4096 | 8.475 | 2.958 | 19.786 | 8.469 | 2.9× / 2.3× | 2104.7 → 1096.8 |
+| 64 | 8192 | 32.918 | 10.960 | 76.136 | 31.505 | 3.0× / 2.4× | 8321.1 → 4257.3 |
+| 128 | 256 | 0.219 | 0.095 | 0.493 | 0.254 | 2.3× / 1.9× | 27.3 → 25.3 |
+| 128 | 1024 | 0.413 | 0.207 | 1.090 | 0.677 | 2.0× / 1.6× | 157.4 → 101.4 |
+| 128 | 4096 | 8.802 | 3.288 | 20.047 | 8.871 | 2.7× / 2.3× | 2128.7 → 1136.8 |
+| 128 | 8192 | 34.312 | 12.314 | 77.734 | 33.015 | 2.8× / 2.4× | 8369.1 → 4337.3 |
+
+Both versions OOM at seq_len = 16384.
+
+**Answer:** The compiled version is 2–3× faster in forward and about 2.4× faster in backward at long sequences. Inductor fuses scale, mask, max, subtract, exp, sum and divide into one or two Triton kernels, so each S × S tensor makes far fewer round trips through HBM. It also halves the forward peak memory, because the temporaries are never materialized. Compilation does *not* reduce the memory saved for backward (identical, about 2 × B·S² floats), and it still runs out of memory at 16384. torch.compile fuses the elementwise work but doesn't restructure the algorithm the way FlashAttention's tiling does.
 
 ### (b)
 > Compile your entire Transformer model in your end-to-end benchmarking script. How does the performance of the forward pass change? What about the combined forward and backward passes and optimizer steps?
 >
 > Deliverable: A table comparing your vanilla and compiled Transformer model.
 
-| Size | Fwd vanilla (ms) | Fwd compiled (ms) | Fwd+bwd+opt vanilla (ms) | Fwd+bwd+opt compiled (ms) |
-|------|-----------------:|------------------:|-------------------------:|--------------------------:|
-| small |  |  |  |  |
-| medium |  |  |  |  |
-| large |  |  |  |  |
-| xl |  |  |  |  |
-| 2.7B |  |  |  |  |
+`benchmark.py --compile` applies `torch.compile(model)`. The model's NVTX ranges are stubbed out first, because they caused graph breaks. I also replaced the deprecated `einx.rearrange` with `einx.id` in `model.py`, since its `warnings.warn` broke the graph in every layer. Setup: RTX 4090 D, FP32, batch 4, context 512, 5 warm-up (including compilation) + 10 measured steps.
 
-**Answer:**
+| Size | Fwd only, vanilla (ms) | Fwd only, compiled (ms) | Fwd+bwd+opt vanilla (ms) | Fwd+bwd+opt compiled (ms) | Speedup (fwd / full step) |
+|------|-----------------:|------------------:|-------------------------:|--------------------------:|---:|
+| small | 27.81 | 18.91 | 104.91 (31.4 + 55.9 + 17.7) | 78.82 (20.0 + 40.2 + 18.7) | 1.47× / 1.33× |
+| medium | 83.78 | 63.37 | 284.12 (84.0 + 164.7 + 35.4) | 217.48 (64.2 + 118.5 + 34.8) | 1.32× / 1.31× |
+| large | 167.55 | 127.92 | OOM; fwd+bwd 506.70 | OOM; fwd+bwd 379.10 | 1.31× / 1.34× (fwd+bwd) |
+| xl | OOM (fwd+bwd) | | | | |
+| 2.7B | OOM (fwd+bwd) | | | | |
+
+**Answer:** Compiling the whole model makes the forward pass 1.3–1.5× faster and forward+backward about 1.35× faster. Inductor fuses the chains of elementwise ops (RMSNorm, SwiGLU, RoPE, residual adds, softmax) into a few Triton kernels, which removes most of the memory traffic and kernel launches. Small benefits most, since it is the most launch-bound. The matmuls themselves don't change. The AdamW step is not compiled, so its time stays the same (about 18 and 35 ms). Fusion also cuts peak memory in forward+backward (medium 10.57 → 8.93 GiB, large 20.27 → 17.04 GiB), because fewer intermediates are saved for backward.
 
 ---
 
